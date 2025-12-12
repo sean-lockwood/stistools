@@ -50,12 +50,11 @@ __version__ = "1.0"
 __vdate__ = "21-August-2025"
 __author__ = "J. Lothringer"
 
+# TODO clean up the global variables if desired, only SECPERDAY is used in this file
 # File types
 EVENTS_TABLE = 1
 
 SECPERDAY = 86400  #D0  # number of sec in a day
-MINPERDAY = 1440   #D0  # number of min in a day
-HRPERDAY = 24      #D0  # number of hours in a day
 
 # Replacing with Astropy unit values
 # Keeping old ones commented out for comparison
@@ -74,9 +73,6 @@ CLIGHT = (u.AU / c.c).to('s').value
 
 JD_TO_MJD = 2400000.5   #d0  # subtract from JD to get MJD
 
-RADIAN = 57.295779513082320877
-
-
 class OrbFileError(ValueError):
     """Orbit file does not cover the requested time range.
     """
@@ -86,7 +82,8 @@ class OrbFileError(ValueError):
 def barycentric_correction(table_names, verbose=True, distance=1e9,
                            hst_orb=None, in_col='TIME',
                            time_script=False, outfiles=None):
-    """
+    """ Calculate barycentric corrections for HST's position.
+
         Calculates time-delay barycentric corrections from HST's position
         to the Solar System barycenter. This correction includes the classic
         geometric Roemer delay, as well as the general relativistic Einstein
@@ -113,17 +110,14 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
         table_names: list[str]
             List of strings with the file names to be time-corrected.
 
+        verbose: bool
+            Prints completion messages during execution.
+
         distance: float
             Distance the object is from HST in AU. Default is a trillion
             AU. Most important for objects in our Solar System as it
             is repsonsible for second-order correction, up to minutes.
             At 1 parsec, the correction can be on the order of a few ms.
-
-        output: str
-            Name of the output FITS file. Will overwrite existing file.
-
-        verbose: bool
-            Prints completion messages during execution.
 
         hst_orb: str
             Name of HST orbital file (generally starts p, ends as .fit) that
@@ -146,38 +140,36 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
 
         Returns
         -------
-        Nothing is returned directly, but the file is written to output.
+        None
+            Nothing is returned directly, but the file is written to output.
     """
 
     if time_script:
         tstart = time.time()
 
+    # TODO need to address errors if single input file and outfile name are submitted
     for ii, in_table_file in enumerate(table_names):
 
         if verbose:
             print(f"odelaytime: processing {in_table_file} ...")
 
         # Copy to new outfile, otherwise overwrite input file.
+        # TODO what should happen if the length of table_names and outfiles don't match?
+        filename = in_table_file
         if outfiles is not None:
+            filename = outfiles[ii]
             if verbose:
-                print(f"Copying {in_table_file} to {outfiles[ii]}")
-            shutil.copy(in_table_file, outfiles[ii])
-            in_hdul = fits.open(outfiles[ii], mode='update')
+                print(f"Copying {in_table_file} to {filename}")
+            shutil.copy(in_table_file, filename)
 
-        else:
-            in_hdul = fits.open(in_table_file, mode='update')
-
+        in_hdul = fits.open(filename, mode='update')
 
         # determine the file type, based on the first extension
         # original code (ln 124) contains some kind of catch all
         # for SCI_IMAGE? It also caught anything outside of those options,
         # might want to add that back in as well.
         extname = in_hdul[1].header['EXTNAME']
-        if extname == "EVENTS":
-            filetype = "EVENTS_TABLE"
-        elif extname == "SCI":
-            filetype = "X1D_TABLE"
-        else:
+        if extname not in ["EVENTS", "SCI"]:
             raise ValueError(f'Unexpected extension name:  {extname}')
 
         if 'DELAYCOR' in in_hdul[0].header and \
@@ -189,12 +181,11 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
         in_hdul[0].header['DELAYCOR'] = "PERFORM"
 
         # COS has no TEXPSTRT in primary header, so use EXPSTART in first ext
+        # TODO removed mjd2 since it isn't used, check that this is okay
         if in_hdul[0].header['INSTRUME'] == "STIS":
             mjd1 = in_hdul[0].header['TEXPSTRT']
-            mjd2 = in_hdul[0].header['TEXPEND']
         elif in_hdul[0].header['INSTRUME'] == "COS":
             mjd1 = in_hdul[1].header['EXPSTART']
-            mjd2 = in_hdul[1].header['EXPEND']
         else:
             raise ValueError('baycentric_correction only works with STIS and COS files.')
 
@@ -206,11 +197,11 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
         else:
             nextend = 1
 
-        if filetype == "EVENTS_TABLE":
+        if extname == "EVENTS":
             # assume (for now) that the last extension is a GTI table
             nevents_tab = max(nextend - 1, 1)
             nsci_ext = 0
-        elif filetype == "X1D_TYPE":
+        elif extname == "SCI":
             nevents_tab = 0
             nsci_ext = nextend
         else:
@@ -224,37 +215,18 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
         #t0_delay = all_delay(mjd1, parallax, objvec, earth_ephem_table,
         #                     len(earth_ephem_table), obs_ephem_table, npts_obs)
 
-        if hst_orb is None:
-            t0_delay = calc_delay_jpl(mjd1, ra, dec, distance=distance)
-        else:
-            t0_delay = calc_delay_orbfile(mjd1, ra, dec, hst_orb, distance=distance)
+        t0_delay = calc_delay(mjd1, ra, dec, hst_orb, distance=distance)
 
-
-        if filetype == "EVENTS_TABLE":
+        if extname == "EVENTS":
             # update times in GTI table
             if 'GTI' in in_hdul:
                 gti_tab = in_hdul['GTI'].data
-                nrows = len(gti_tab)
                 for row in gti_tab:
-                    tm = row['START']
-                    epoch = mjd1 + tm / SECPERDAY
-
-
-                    if hst_orb is None:
-                        delta_sec = calc_delay_jpl(epoch, ra, dec, distance=distance)
-                    else:
-                        delta_sec = calc_delay_orbfile(epoch, ra, dec, hst_orb, distance=distance)
-
-                    row['START'] = tm + (delta_sec - t0_delay).value * SECPERDAY
-
-                    tm = row['STOP']
-                    epoch = mjd1 + tm / SECPERDAY
-                    if hst_orb is None:
-                        delta_sec = calc_delay_jpl(epoch, ra, dec, distance=distance)
-                    else:
-                        delta_sec = calc_delay_orbfile(epoch, ra, dec, hst_orb, distance=distance)
-
-                    row['STOP'] = tm + (delta_sec - t0_delay).value * SECPERDAY
+                    for key in ['START', 'STOP']:
+                        tm = row[key]
+                        epoch = mjd1 + tm / SECPERDAY
+                        delta_sec = calc_delay(epoch, ra, dec, hst_orb, distance=distance)
+                        row[key] = tm + (delta_sec - t0_delay).value * SECPERDAY
 
                 in_hdul.flush()
 
@@ -274,7 +246,6 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
         for e_indx in range(1, nevents_tab + 1):
             events_tab = in_hdul['EVENTS', e_indx]
             mjd1 = events_tab.header['EXPSTART']
-            mjd2 = events_tab.header['EXPEND']
 
             # find the time (since EXPSTART) column in the table
             nrows = len(events_tab.data[in_col])
@@ -289,10 +260,8 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
             #re-written to do all rows at once, so we can interpolate times,
             #instead of calling Horizons 4.5 million times
             epoch_array = mjd1 + time_array / SECPERDAY
-            if hst_orb is None:
-                delta_sec = calc_delay_jpl(epoch_array, ra, dec, distance=distance)
-            else:
-                delta_sec = calc_delay_orbfile(epoch_array, ra, dec, hst_orb, distance=distance)
+            # TODO do we need to pass in_col here?
+            delta_sec = calc_delay(epoch_array, ra, dec, hst_orb, distance=distance)
 
             # This is correcting for the difference between the new time interval
             # and the *corrected* exposure start time
@@ -303,21 +272,12 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
             in_hdul['EVENTS', e_indx].data[in_col] = time_array
 
             # add delaytime to EXPSTART and EXPEND, and update header
-            if hst_orb is None:
-                delta_sec = calc_delay_jpl(mjd1, ra, dec, distance=distance)
-            else:
-                delta_sec = calc_delay_orbfile(mjd1, ra, dec, hst_orb, distance=distance)
+            for key in ['EXPSTART', 'EXPEND']:
+                mjd = events_tab.header[key]
+                # TODO do we need to pass in_col here?
+                delta_sec = calc_delay(mjd, ra, dec, hst_orb, distance=distance)
+                events_tab.header[key] = mjd + delta_sec.value
 
-            events_tab.header['EXPSTART'] = mjd1 + delta_sec.value
-
-
-            # DOUBLE CHECK FOR TYPO, should probably be mjd2
-            if hst_orb is None:
-                delta_sec = calc_delay_jpl(mjd2, ra, dec, distance=distance)
-            else:
-                delta_sec = calc_delay_orbfile(mjd2, ra, dec, hst_orb, distance=distance)
-
-            events_tab.header['EXPEND'] = mjd2 + delta_sec.value
             in_hdul.flush()
             if verbose:
                 print(f"    [EVENTS,{e_indx}] extension has been updated")
@@ -333,23 +293,12 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
             modified = False
 
             # add delaytime to EXPSTART and EXPEND, and update header
-            if "EXPSTART" in cur_tab.header:
-                mjd1 = cur_tab.header['EXPSTART']
-                if hst_orb is None:
-                    delta_sec = calc_delay_jpl(mjd1, ra, dec, distance=distance)
-                else:
-                    delta_sec = calc_delay_orbfile(mjd1, ra, dec, hst_orb, distance=distance)
-                cur_tab.header['EXPSTART'] = mjd1 + delta_sec.value
-                modified = True
-
-            if "EXPEND" in cur_tab.header:
-                mjd2 = cur_tab.header['EXPEND']
-                if hst_orb is None:
-                    delta_sec = calc_delay_jpl(mjd2, ra, dec, distance=distance)
-                else:
-                    delta_sec = calc_delay_orbfile(mjd2, ra, dec, hst_orb, distance=distance)
-                cur_tab.header['EXPEND'] = mjd2 + delta_sec.value
-                modified = True
+            for key in ['EXPSTART', 'EXPEND']:
+                if key in cur_tab.header:
+                    mjd = cur_tab.header[key]
+                    delta_sec = calc_delay(mjd, ra, dec, hst_orb, distance=distance)
+                    cur_tab.header[key] = mjd + delta_sec.value
+                    modified = True
 
             in_hdul.flush()
             if verbose and modified:
@@ -364,22 +313,11 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
         # add delaytime to TEXPSTRT and TEXPEND, and update primary header
         # COS has no TEXPSTRT in primary header
         if in_hdul[0].header['INSTRUME'] == "STIS":
-            mjd1 = in_hdul[0].header['TEXPSTRT']
-            if hst_orb is None:
-                delta_sec = calc_delay_jpl(mjd1, ra, dec, distance=distance)
-            else:
-                delta_sec = calc_delay_orbfile(mjd1, ra, dec, hst_orb,
-                                               distance=distance)
+            for key in ['TEXPSTRT', 'TEXPEND']:
+                mjd = in_hdul[0].header[key]
+                delta_sec = calc_delay(mjd, ra, dec, hst_orb, distance=distance)
 
-            in_hdul[0].header['TEXPSTRT'] = mjd1 + delta_sec.value
-
-            mjd2 = in_hdul[0].header['TEXPEND']
-            if hst_orb is None:
-                delta_sec = calc_delay_jpl(mjd2, ra, dec, distance=distance)
-            else:
-                delta_sec = calc_delay_orbfile(mjd2, ra, dec, hst_orb,
-                                               distance=distance)
-            in_hdul[0].header['TEXPEND'] = mjd2 + delta_sec.value
+                in_hdul[0].header[key] = mjd + delta_sec.value
 
         # add keyword to flag the fact that the times have been corrected
         in_hdul[0].header['DELAYCOR'] = ("COMPLETE",
@@ -404,30 +342,47 @@ def barycentric_correction(table_names, verbose=True, distance=1e9,
             print(f'Checkpoint 3: {tcheck3 - tstart} s')
 
 
-def calc_delay_jpl(times, ra, dec, distance=1e9, verbose=True):
-    """
-    Calculate the barycentric light-travel time correction for HST using JPL Horizons.
+def calc_delay(times, ra, dec, hst_orb=None, distance=1e9, in_col='Time', verbose=True):
+    """Calculate the light-travel time correction for HST observations.
 
-    Compute the barycentric light-travel time delay for the Hubble Space Telescope (HST)
-    at the provided observation times and a target sky position (RA, Dec) by querying
-    JPL Horizons for HST's geocentric state-vector (or interpolating a regular-sampled
-    vector set) and combining it with Earth's barycentric position. A finite-distance
-    correction is applied to account for targets that are not at infinite distance.
+    This function computes the barycentric light-travel time delay for the Hubble Space Telescope (HST)
+    given a set of observation times and a target sky position (RA, Dec).
+
+    If an HST orbit file is provided, it interpolates HST’s position from a provided orbit file, combines
+    it with Earth's barycentric position, and calculates the light-travel time correction to the Solar
+    System barycenter, including a finite-distance correction term.
+
+    If an HST orbit file is not provided, this function queries JPL Horizons for HST's geocentric
+    state-vector (or interpolating a regular-sampled vector set) and combining it with Earth's
+    barycentric position. A finite-distance correction is applied to account for targets that are
+    not at infinite distance.
 
     Parameters
     ----------
-    times : array-like or `~astropy.time.Time`
-        Observation times in Modified Julian Date (MJD). Can be a scalar or an array.
-    ra : float or `~astropy.units.Quantity`
+    times : array-like or float
+        Observation times in Modified Julian Date (MJD), corresponding to HST exposures.
+
+    ra : float
         Right ascension of the target in degrees.
-    dec : float or `~astropy.units.Quantity`
+
+    dec : float
         Declination of the target in degrees.
+
+    hst_orb : str, optional
+        Path to the HST orbit FITS file. This file must contain columns `TIME`, `X`, `Y`, and `Z`
+        giving HST’s position (in km) relative to the Earth's center.
+
     distance : float, optional
-        Distance to the target (default ``1e9``). This value is used in the finite-distance
-        correction term. (See ``Notes`` for how it enters the equation.)
+        Distance to the target in kilometers (default is `1e9`, effectively infinite distance).
+        Used to apply the finite-distance light-travel time correction.
+
+    in_col : str, optional
+        If orbital file uses something other than 'Time' for the time axis, replace
+        with the correct column name.
+
     verbose : bool, optional
-        If True (default) print diagnostics about interpolation, the finite-distance
-        correction, and the computed light-travel times.
+        If True (default), print information about the finite-distance correction
+        and the calculated light-travel times.
 
     Returns
     -------
@@ -440,35 +395,14 @@ def calc_delay_jpl(times, ra, dec, distance=1e9, verbose=True):
     -----
     - Uses the JPL planetary ephemeris (``jpl``) via Astropy's ``solar_system_ephemeris``
       for consistency with Horizons.
-    - For multiple times the function queries Horizons for HST (-48, location 500)
-      with a regular step (1 minute) over the time range (plus a 5-minute margin)
-      and cubic-interpolates the returned vectors to the requested times. For a single
-      scalar time it queries Horizons directly at that epoch.
     - The finite-distance correction implemented here follows the same algebraic
       form used elsewhere in this codebase:
         correction_term = (-0.5 / D) * (|r|^2 - (n·r)^2) / c
       where `r` is the HST barycentric position vector, `n` is the unit vector toward
       the target, `D` is the provided `distance`, and `c` is the speed of light.
       The expression is converted into days before being returned.
-    - The HST vector returned from Horizons is treated as geocentric and then transformed
-      to ITRS/ICRS and added to Earth's barycentric position from Astropy's
-      ``get_body_barycentric('earth', ...)`` to obtain HST's barycentric position.
     - Requires `astroquery` (Horizons), Astropy with the `jplephem` ephemeris available,
       and a working internet connection for Horizons queries when not using a local orbit file.
-
-    Raises
-    ------
-    Exception
-        If the Horizons query or interpolation fails to produce vectors covering the
-        requested time range, or if the vector transformation cannot be performed.
-
-    Performance / Accuracy Considerations
-    -------------------------------------
-    - Interpolation at 1-minute sampling is a compromise between speed and accuracy;
-      a timing error of ~1 minute corresponds to a maximum light-travel time error of
-      a few milliseconds. Increase sampling density or query exact epochs if sub-ms
-      accuracy is required.
-    - Converting large arrays of epochs and coordinate transforms may be time-consuming.
 
     Examples
     --------
@@ -480,11 +414,21 @@ def calc_delay_jpl(times, ra, dec, distance=1e9, verbose=True):
     >>> # multiple times
     >>> times = [60200.123, 60200.124, 60200.125]
     >>> lt_array = calc_delay_jpl(times, 210.8023, -47.393, distance=1e9, verbose=False)
+
+    >>> # Using an HST orbit file
+    >>> barycentric_correction.calc_delay([55521.123], 210.8023, -47.393, hst_orb='pubj0000r.fit')
+    Finite distance correction: [-7.80563708e-08] s
+    Light travel times: [-405.56687377] s
     """
+
+    has_hst_orb = False
+    if hst_orb is not None:
+        has_hst_orb = True
 
     # Using the JPL epehermis to be consistent with what Horizons gives
     # see https://github.com/astropy/astropy/pull/11608
     # Will require jplephem package, but that's already in stenv!
+    # TODO need to add jplephem to package requirements
     solar_system_ephemeris.set('jpl')
 
     # Put times into Astropy time object
@@ -496,8 +440,138 @@ def calc_delay_jpl(times, ra, dec, distance=1e9, verbose=True):
                      location=EarthLocation.\
                      from_geocentric(0, 0, 0, unit='m'))
 
-    # Get HST's location
 
+    # Get HST's location
+    hstarr = get_hst_location(times, times_geo, hst_orb=hst_orb, in_col=in_col, verbose=verbose)
+
+    # Caclculate HST's position relative to the solar system barycenter
+    # and determine it's cartesian ITRS coordinates
+    hstbary, itrs_coordinates = calculate_hst_coordinates(times_geo, hstarr, has_hst_orb=has_hst_orb)
+
+    # Define our targets location on the sky
+    target = SkyCoord(ra, dec, unit=(u.deg, u.deg), frame='icrs')
+
+    # Put into an array to dot with hstbary
+    # Cartesian makes this a unit vector in direction of target
+    target_arr = [target.cartesian.x.value,
+                target.cartesian.y.value,
+                target.cartesian.z.value]
+
+    # Calculate the finite-distance correction term
+    if has_hst_orb:
+        correction_term = ((-0.5 / distance) *
+                        (np.sum((np.array(hstbary))**2) -
+                            (np.dot(target_arr, hstbary))**2) * u.AU /
+                        c.c).to('day')
+    else:
+        # Actually just need to make the above sum over the correction axis
+        # if hstbary has multiple points
+        # TODO check if the multiple points handling (setting sum axis=0)
+        # needs to be done for the HST orb file case too
+        correction_term = ((-0.5 / distance) *
+                          (np.sum((np.array(hstbary))**2, axis=0) -
+                            (np.dot(target_arr, hstbary))**2) * u.AU /
+                          c.c).to('day')
+
+    if verbose:
+        if correction_term.size < 10:
+            print(f"Finite distance correction: {correction_term.to('s')}")
+        else:
+            print(f"Finite distance correction: \
+                    {correction_term[0:10].to('s')}")
+
+    # Let's now define HST's location relative to the barycenter
+    # from_geocentric() is expecting an ITRS coordinate!
+
+    with erfa_astrom.set(ErfaAstromInterpolator(1000 * u.s)):
+        hstloc = EarthLocation.from_geocentric(x=itrs_coordinates.x,
+                                                y=itrs_coordinates.y,
+                                                z=itrs_coordinates.z)
+        # Define the times, now with the correct location
+        hsttime = Time(times, format='mjd', scale='utc',
+                        location=hstloc)
+
+        # Calculate the light travel time,
+        # adding the correction term above.
+        # Then define the new barycenter times!
+        lt_time = hsttime.light_travel_time(target) + correction_term
+
+    if verbose:
+        if lt_time.size < 10:
+            print(f"Light travel times: {lt_time.to('s')}")
+        else:
+            print(f"Light travel times: {lt_time[0:10].to('s')}")
+    #ssbtimes = hsttime.tdb + lt_time
+
+    return lt_time
+
+def get_hst_location(times, times_geo, hst_orb=None, in_col='Time', verbose=True):
+    """Get HST's location from an HST orbit file or a JPL Horizon query.
+
+    Parameters
+    ----------
+    times : array-like or `~astropy.time.Time`
+        Observation times in Modified Julian Date (MJD). Can be a scalar or an array.
+
+    times_geo : array-like or `~astropy.time.Time`
+        Geocentric observation times.
+
+    hst_orb : str, optional
+        Path to the HST orbit FITS file. This file must contain columns `TIME`, `X`, `Y`, and `Z`
+        giving HST’s position (in km) relative to the Earth's center.
+
+    in_col : str, optional
+        If orbital file uses something other than 'Time' for the time axis, replace
+        with the correct column name.
+
+    verbose : bool, optional
+        If True (default), print additional status information.
+
+    Returns
+    -------
+    hstarr : `array-like, ~astropy.units.Quantity`
+        HST position vector stored as a list of cartesian coordinates
+        in astropy units of AU.
+
+    Raises
+    ------
+    OrbFileError
+        If the orbit file does not cover the requested time range.
+
+    Exception
+        If the Horizons query or interpolation fails to produce vectors covering the
+        requested time range, or if the vector transformation cannot be performed.
+
+    Notes
+    -----
+    - When using an HST orbit file, interpolates HST’s orbital position at each observation time using cubic interpolation
+      to avoid excessive Horizons queries.  The resulting correction term accounts for HST’s motion relative to the Solar System barycenter.
+    - For multiple times the function queries Horizons for HST (-48, location 500)
+      with a regular step (1 minute) over the time range (plus a 5-minute margin)
+      and cubic-interpolates the returned vectors to the requested times. For a single
+      scalar time it queries Horizons directly at that epoch.
+    - Requires `astroquery` (Horizons), Astropy with the `jplephem` ephemeris available,
+      and a working internet connection for Horizons queries when not using a local orbit file.
+    """
+
+    # If using an HST ORB file
+    if hst_orb is not None:
+        with fits.open(hst_orb) as hdu_orb:
+            f_hstx = interp1d(float(hdu_orb[1].header['FIRSTMJD']) + hdu_orb[1].data[in_col].astype(np.float64) / SECPERDAY, hdu_orb[1].data['X'], kind='cubic')
+            f_hsty = interp1d(float(hdu_orb[1].header['FIRSTMJD']) + hdu_orb[1].data[in_col].astype(np.float64) / SECPERDAY, hdu_orb[1].data['Y'], kind='cubic')
+            f_hstz = interp1d(float(hdu_orb[1].header['FIRSTMJD']) + hdu_orb[1].data[in_col].astype(np.float64) / SECPERDAY, hdu_orb[1].data['Z'], kind='cubic')
+
+        try:
+            hstvecx = f_hstx(times_geo.tdb.mjd)
+            hstvecy = f_hsty(times_geo.tdb.mjd)
+            hstvecz = f_hstz(times_geo.tdb.mjd)
+        except ValueError as e:
+            raise OrbFileError('Orbit file does not match observation times.  '
+                            'Make sure you have got the correct one.') from e
+
+        hstarr = [hstvecx, hstvecy, hstvecz] * u.km
+
+    # If no HST ORB file
     # Interpolate HST's position if more than just one time:
     # We can't query all times to Horizons because there's
     # too many. Let's get HST's position every minutes instead,
@@ -506,9 +580,7 @@ def calc_delay_jpl(times, ra, dec, distance=1e9, verbose=True):
     # off by a minute, that would be a max of 6ms light travel time
     # So with interpolation, we'll be dandy.
     # Adding one minute to each side to avoid extrapolating
-
-    # Interpolate HST's position if more than just one time
-    if np.isscalar(times) is False:
+    elif np.isscalar(times) is False:
         if verbose:
             print('Multiple times: interpolating positions')
         # Query five minute before and after min and max times
@@ -548,281 +620,90 @@ def calc_delay_jpl(times, ra, dec, distance=1e9, verbose=True):
         # Re-package witn units
         hstarr = [hstvec['x'][0], hstvec['y'][0], hstvec['z'][0]] * u.AU
 
-    # Convert from vector table to Astropy Quantity
-    # Then convert from GCRS to ITRS
-    # i.e., from Earth-centric to Barycentric
-    # This will still be the distance from HST to Earth,
-    # but in ICRS directions
-    # hstarr = [hstvec['x'][0], hstvec['y'][0], hstvec['z'][0]] * u.AU
+    return hstarr
 
-    with erfa_astrom.set(ErfaAstromInterpolator(1000 * u.s)):
-
-        # Make into GCRS object at proper times
-        hstGCRS = GCRS([hstarr[0],
-                        hstarr[1],
-                        hstarr[2]],
-                       representation_type='cartesian',
-                       obstime=times_geo)
-
-        # Convert to ICRS so we can add to Earth's barycentric location
-        # This takes a bit of time if there are many times to convert
-        hstITRS = hstGCRS.transform_to(ITRS(obstime=times_geo))
-
-
-        # Get Earth's position
-        # Can also take a few minutes with lots of times
-        earthICRS = get_body_barycentric('earth', times_geo)
-
-        # Add the two vectors together to get HST's position relative
-        # to the Solar System barycenter
-        hstbary = [earthICRS.x.to('AU').value + hstITRS.x.value,
-                   earthICRS.y.to('AU').value + hstITRS.y.value,
-                   earthICRS.z.to('AU').value + hstITRS.z.value]
-
-        # Define our targets location on the sky
-        target = SkyCoord(ra, dec, unit=(u.deg, u.deg), frame='icrs')
-
-        # Put into an array to dot with hstbary
-        # Cartesian makes this a unit vector in direction of target
-        target_arr = [target.cartesian.x.value,
-                      target.cartesian.y.value,
-                      target.cartesian.z.value]
-
-        # Calculate the finite-distance correction term
-
-        # correction_term = []
-        # for j in range(shape(hstbary)[1]):
-        #     hstbary_tmp = np.array([hstbary[0][j],hstbary[1][j],hstbary[2][j]])
-        #     correction_tmp = ((-0.5 / distance) *
-        #                        (np.sum((np.array(hstbary_tmp))**2) -
-        #                         (np.dot(target_arr, hstbary_tmp))**2) * u.AU /
-        #                        c.c).to('day')
-        #     correction_term.append(correction_tmp.value)
-        # correction_term*u.day
-
-        # This is wrong when hstbary is multiple points!
-        # The more points querried, the larger the correction lmaoooo
-        #correction_term = ((-0.5 / distance) *
-        #                   (np.sum((np.array(hstbary))**2) -
-        #                    (np.dot(target_arr, hstbary))**2) * u.AU /
-        #                   c.c).to('day')
-
-        # Actually just need to make the above sum over the correction axis
-        correction_term = ((-0.5 / distance) *
-                          (np.sum((np.array(hstbary))**2, axis=0) -
-                            (np.dot(target_arr, hstbary))**2) * u.AU /
-                          c.c).to('day')
-
-        if verbose:
-            if correction_term.size < 10:
-                print(f"Finite distance correction: {correction_term.to('s')}")
-            else:
-                print(f"Finite distance correction: \
-                      {correction_term[0:10].to('s')}")
-
-        # Let's now define HST's location relative to the barycenter
-        hstloc = EarthLocation.from_geocentric(x=hstITRS.x,
-                                               y=hstITRS.y,
-                                               z=hstITRS.z)
-        # Define the times, now with the correct location
-        hsttime = Time(times, format='mjd', scale='utc',
-                       location=hstloc)
-
-        # Calculate the light travel time,
-        # adding the correction term above.
-        # Then define the new barycenter times!
-        lt_time = hsttime.light_travel_time(target) + correction_term
-    if verbose:
-        if lt_time.size < 10:
-            print(f"Light travel times: {lt_time.to('s')}")
-        else:
-            print(f"Light travel times: {lt_time[0:10].to('s')}")
-    #ssbtimes = hsttime.tdb + lt_time
-
-    return lt_time
-
-
-def calc_delay_orbfile(times, ra, dec, hst_orb, distance=1e9, verbose=True, in_col='Time'):
-    """
-    Calculate the light-travel time correction for HST observations using an orbit file.
-
-    This function computes the barycentric light-travel time delay for the Hubble Space Telescope (HST)
-    given a set of observation times and a target sky position (RA, Dec). It interpolates HST’s position
-    from a provided orbit file, combines it with Earth's barycentric position, and calculates the
-    light-travel time correction to the Solar System barycenter, including a finite-distance correction term.
+def calculate_hst_coordinates(times_geo, hstarr, has_hst_orb=False):
+    """Calculate HST's coordinates relative to the Solar System barycenter.
 
     Parameters
     ----------
-    times : array-like or float
-        Observation times in Modified Julian Date (MJD), corresponding to HST exposures.
-    ra : float
-        Right ascension of the target in degrees.
-    dec : float
-        Declination of the target in degrees.
-    hst_orb : str
-        Path to the HST orbit FITS file. This file must contain columns `TIME`, `X`, `Y`, and `Z`
-        giving HST’s position (in km) relative to the Earth's center.
-    distance : float, optional
-        Distance to the target in kilometers (default is `1e9`, effectively infinite distance).
-        Used to apply the finite-distance light-travel time correction.
-    verbose : bool, optional
-        If True (default), print information about the finite-distance correction
-        and the calculated light-travel times.
-    in_col : str, optional
-        If orbital file uses something other than 'Time' for the time axis, replace
-        with the correct column name.
+    times : array-like or `~astropy.time.Time`
+        Geocentric observation times in Modified Julian Date (MJD).
+        Can be a scalar or an array.
+
+    hstarr : `array-like, ~astropy.units.Quantity`
+        HST position vector stored as a list of cartesian coordinates
+        in astropy units of AU.
+
+    has_hst_orb : bool, optional
+        Flag to indicate whether the HST position vector in hstarr was
+        taken from an HST orbit file, by default False
 
     Returns
     -------
-    lt_time : `~astropy.units.Quantity`
-        The barycentric light-travel time correction(s) in days, including the finite-distance correction term.
+    hstbary : list
+        Vector of HST's position relative to the Solar System barycenter.
+
+    hst_itrs_coordinates : `~astropy.coordinates.builtin_frames.itrs.ITRS`
+        ITRS frame coordinates of HST's location relative to the Solar
+        System barycenter.
 
     Notes
     -----
-    - Uses the JPL planetary ephemeris (`jplephem`) for consistency with NASA Horizons.
-    - Interpolates HST’s orbital position at each observation time using cubic interpolation
-      to avoid excessive Horizons queries.
-    - The resulting correction term accounts for HST’s motion relative to the Solar System barycenter.
-    - The finite-distance correction term scales as `~(r^2 - (r·n)^2) / (2cD)`, where
-      `r` is HST’s barycentric position vector, `n` is the unit vector toward the target,
-      `c` is the speed of light, and `D` is the target distance.
-
-    Raises
-    ------
-    OrbFileError
-        If the orbit file does not cover the requested time range.
-
-    Examples
-    --------
-    >>> barycentric_correction.calc_delay_orbfile([55521.123], 210.8023, -47.393, hst_orb='pubj0000r.fit')
-    Finite distance correction: [-7.80563708e-08] s
-    Light travel times: [-405.56687377] s
+    - The HST vector returned from Horizons is treated as geocentric and then transformed
+      to ITRS/ICRS and added to Earth's barycentric position from Astropy's
+      ``get_body_barycentric('earth', ...)`` to obtain HST's barycentric position.
     """
 
-    # Using the JPL epehermis to be consistent with what Horizons gives
-    # see https://github.com/astropy/astropy/pull/11608
-    # Will require jplephem package, but that's already in stenv!
-    solar_system_ephemeris.set('jpl')
-
-    # Put times into Astropy time object
-    # We will query HST's position at this time
-    # We will be off by the HST-geocenter light travel time, FWIW
-    times_geo = Time(times,
-                     format='mjd',
-                     scale='utc',
-                     location=EarthLocation.\
-                     from_geocentric(0, 0, 0, unit='m'))
-
-    # Get HST's location
-
-    # Interpolate HST's position if more than just one time:
-    # We can't query all times to Horizons because there's
-    # too many. Let's get HST's position every minutes instead,
-    # and then interpolate...
-    # Position every minute should be good enough. If we were
-    # off by a minute, that would be a max of 6ms light travel time
-    # So with interpolation, we'll be dandy.
-    # Adding one minute to each side to avoid extrapolating
-
-
-    # HST ORB file
-    with fits.open(hst_orb) as hdu_orb:
-        f_hstx = interp1d(float(hdu_orb[1].header['FIRSTMJD']) + hdu_orb[1].data[in_col].astype(np.float64) / 86400, hdu_orb[1].data['X'], kind='cubic')
-        f_hsty = interp1d(float(hdu_orb[1].header['FIRSTMJD']) + hdu_orb[1].data[in_col].astype(np.float64) / 86400, hdu_orb[1].data['Y'], kind='cubic')
-        f_hstz = interp1d(float(hdu_orb[1].header['FIRSTMJD']) + hdu_orb[1].data[in_col].astype(np.float64) / 86400, hdu_orb[1].data['Z'], kind='cubic')
-
-        try:
-            hstvecx = f_hstx(times_geo.tdb.mjd)
-            hstvecy = f_hsty(times_geo.tdb.mjd)
-            hstvecz = f_hstz(times_geo.tdb.mjd)
-        except ValueError as e:
-            raise OrbFileError('Orbit file does not match observation times.  '
-                               'Make sure you have got the correct one.') from e
-
-        hstarr = [hstvecx, hstvecy, hstvecz] * u.km
-
-
-    # Convert from vector table to Astropy Quantity
-    # Then convert from GCRS to ITRS
-    # i.e., from Earth-centric to Barycentric
-    # This will still be the distance from HST to Earth,
-    # but in ITRS directions
-    #hstarr = [hstvec['x'][0], hstvec['y'][0], hstvec['z'][0]] * u.AU
-
     with erfa_astrom.set(ErfaAstromInterpolator(1000 * u.s)):
-
-            # Make into ICRS object at proper times
-        hstICRS = ICRS([hstarr[0],
-                        hstarr[1],
-                        hstarr[2]],
-                       representation_type='cartesian')
 
         # Get Earth's position
         # Can also take a few minutes with lots of times
         earthICRS = get_body_barycentric('earth', times_geo)
 
-        # Add the two vectors together to get HST's position relative
-        # to the Solar System barycenter
-        # We keep this in an array format to calculate the correction term,
-        # but convert to ICRS coordinate for light travel times.
-        hstbary = [earthICRS.x.to('AU').value + hstICRS.x.to('AU').value,
-                   earthICRS.y.to('AU').value + hstICRS.y.to('AU').value,
-                   earthICRS.z.to('AU').value + hstICRS.z.to('AU').value]
+        if has_hst_orb:
+            # Make into ICRS object at proper times
+            hstICRS = ICRS([hstarr[0],
+                            hstarr[1],
+                            hstarr[2]],
+                            representation_type='cartesian')
 
-        hstbary_icrs = ICRS(hstbary * u.AU, representation_type='cartesian')
+            # Add the two vectors together to get HST's position relative
+            # to the Solar System barycenter
+            # We keep this in an array format to calculate the correction term,
+            # but convert to ICRS coordinate for light travel times.
+            hstbary = [earthICRS.x.to('AU').value + hstICRS.x.to('AU').value,
+                    earthICRS.y.to('AU').value + hstICRS.y.to('AU').value,
+                    earthICRS.z.to('AU').value + hstICRS.z.to('AU').value]
 
-        # from_geocentric() is expecting an ITRS coordinate, so we need to convert.
-        hstbary_itrs = hstbary_icrs.transform_to(ITRS(obstime=times_geo))
-        itrs_cartesian = hstbary_itrs.cartesian
+            hstbary_icrs = ICRS(hstbary * u.AU, representation_type='cartesian')
 
-        # Define our targets location on the sky
-        target = SkyCoord(ra, dec, unit=(u.deg, u.deg), frame='icrs')
-
-        # Put into an array to dot with hstbary
-        # Cartesian makes this a unit vector in direction of target
-        target_arr = [target.cartesian.x.value,
-                      target.cartesian.y.value,
-                      target.cartesian.z.value]
-
-        # Calculate the finite-distance correction term
-        correction_term = ((-0.5 / distance) *
-                           (np.sum((np.array(hstbary))**2) -
-                            (np.dot(target_arr, hstbary))**2) * u.AU /
-                           c.c).to('day')
-
-        if verbose:
-            if correction_term.size < 10:
-                print(f"Finite distance correction: {correction_term.to('s')}")
-            else:
-                print(f"Finite distance correction: \
-                      {correction_term[0:10].to('s')}")
-
-        # Let's now define HST's location relative to the barycenter
-        # from_geocentric() is expecting an ITRS coordinate!
-        hstloc = EarthLocation.from_geocentric(x=itrs_cartesian.x,
-                                               y=itrs_cartesian.y,
-                                               z=itrs_cartesian.z)
-        # Define the times, now with the correct location
-        hsttime = Time(times, format='mjd', scale='utc',
-                       location=hstloc)
-
-        # Calculate the light travel time,
-        # adding the correction term above.
-        # Then define the new barycenter times!
-        lt_time = hsttime.light_travel_time(target) + correction_term
-    if verbose:
-        if lt_time.size < 10:
-            print(f"Light travel times: {lt_time.to('s')}")
+            # from_geocentric() is expecting an ITRS coordinate, so we need to convert.
+            hstbary_itrs = hstbary_icrs.transform_to(ITRS(obstime=times_geo))
+            hst_itrs_coordinates = hstbary_itrs.cartesian
         else:
-            print(f"Light travel times: {lt_time[0:10].to('s')}")
-    #ssbtimes = hsttime.tdb + lt_time
+            # Make into GCRS object at proper times
+            hstGCRS = GCRS([hstarr[0],
+                            hstarr[1],
+                            hstarr[2]],
+                        representation_type='cartesian',
+                        obstime=times_geo)
 
-    return lt_time
+            # Convert to ICRS so we can add to Earth's barycentric location
+            # This takes a bit of time if there are many times to convert
+            hst_itrs_coordinates = hstGCRS.transform_to(ITRS(obstime=times_geo))
+
+            # Add the two vectors together to get HST's position relative
+            # to the Solar System barycenter
+            hstbary = [earthICRS.x.to('AU').value + hst_itrs_coordinates.x.value,
+                    earthICRS.y.to('AU').value + hst_itrs_coordinates.y.value,
+                    earthICRS.z.to('AU').value + hst_itrs_coordinates.z.value]
+
+    return hstbary, hst_itrs_coordinates
 
 
 def odelay_file_compare(file1, file2):
-    """
-    Compare timing information between two FITS files.
+    """Compare timing information between two FITS files.
 
     Computes and prints the differences in exposure start times and data timestamps
     between two FITS files, typically used for verifying time coordinate consistency
@@ -832,6 +713,7 @@ def odelay_file_compare(file1, file2):
     ----------
     file1 : str
         Path to the first FITS file.
+
     file2 : str
         Path to the second FITS file to compare against file1.
 
@@ -867,19 +749,18 @@ def odelay_file_compare(file1, file2):
     In case it is helpful, the difference between TT and TDB_BJD is -0.001497 s
     """
 
+    # TODO CRH:  it does not appear that any primary header's are being updated with this function call
     with fits.open(file1) as f1, fits.open(file2) as f2:
         # IF STIS
         # add delaytime to TEXPSTRT and TEXPEND, and update primary header
         # COS has no TEXPSTRT in primary header
         if f1[0].header['INSTRUME'] == "STIS":
-            print(f"TEXPSTRT file2-file1 {(f2[0].header['TEXPSTRT'] - f1[0].header['TEXPSTRT']) * 24 * 60 * 60} seconds")
-    
-        if f1[0].header['INSTRUME'] == "STIS":
+            print(f"TEXPSTRT file2-file1 {(f2[0].header['TEXPSTRT'] - f1[0].header['TEXPSTRT']) * SECPERDAY} seconds")
             t = Time(f1[0].header['TEXPSTRT'], format='mjd', scale='utc')
         elif f1[0].header['INSTRUME'] == "COS":
             t = Time(f1[1].header['EXPSTART'], format='mjd', scale='utc')
         else:
             raise ValueError(f"Unexpected INSTRUME value: {f1[1].header['EXPSTART']}")
 
-    diff = (t.tdb.value - t.tt.value) * 24 * 60 * 60
+    diff = (t.tdb.value - t.tt.value) * SECPERDAY
     print(f'In case it is helpful, the difference between TT and TDB_BJD is {diff:.6f} s')
